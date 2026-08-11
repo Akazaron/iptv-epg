@@ -28,6 +28,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Validate mapping.json
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, sys
+          with open("mapping.json", encoding="utf-8-sig") as fh:
+              mapping = json.load(fh)
+          # A value must be an id an upstream source publishes, never another
+          # provider key. build.py fans out from source ids and does NOT resolve
+          # chains, so a chained entry silently emits no channel at all.
+          chains = {k: v for k, v in mapping.items() if v in mapping and mapping[v] != v}
+          for k, v in sorted(chains.items()):
+              print(f"::error::chained mapping: {k} -> {v}, but {v} -> {mapping[v]}")
+          if chains:
+              sys.exit(f"{len(chains)} chained entries - point them straight at the source id")
+          print(f"mapping.json OK: {len(mapping)} entries, no chains")
+          PY
+
       - name: Build the guide
         run: python build.py
 
@@ -52,6 +70,27 @@ jobs:
           pr = len(root.findall("programme"))
           print(f"parsed OK: {ch} channels, {pr} programmes")
           assert ch > 100 and pr > 10000, "guide looks empty - not publishing"
+          PY
+
+      - name: Check every mapping entry produced a guide
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import gzip, json, sys, xml.etree.ElementTree as ET
+          from collections import Counter
+          with open("mapping.json", encoding="utf-8-sig") as fh:
+              mapping = json.load(fh)
+          with gzip.open("epg.xml.gz") as fh:
+              root = ET.parse(fh).getroot()
+          progs = Counter(p.get("channel") for p in root.findall("programme"))
+          # A key with no programmes means its target carries nothing upstream -
+          # renamed, retired, or a typo. Refuse to publish a mapping that lies.
+          dead = sorted(k for k in mapping if not progs.get(k))
+          for k in dead:
+              print(f"::error::dead mapping: {k} -> {mapping[k]} produced no programmes")
+          if dead:
+              sys.exit(f"{len(dead)} of {len(mapping)} mapping entries produced no guide")
+          print(f"all {len(mapping)} mapping entries carry a guide")
           PY
 
       - name: Publish to the epg branch
