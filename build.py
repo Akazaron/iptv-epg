@@ -25,7 +25,7 @@ import os
 import sys
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 SOURCES = [
     ("freeview",   "https://raw.githubusercontent.com/dp247/Freeview-EPG/master/epg.xml"),
@@ -46,6 +46,88 @@ def fetch(url: str) -> bytes:
     if data[:2] == b"\x1f\x8b":
         data = gzip.decompress(data)
     return data
+
+
+# ---------------------------------------------------------------------------
+# Synthetic "no guide data" channel - NOT upstream data
+#
+# The provider tags ~446 of its channels with epg_channel_id "TS" and feeds
+# them filler programmes titled "TimeShift 14", "TimeShift 15", ... - a fake
+# schedule that tells the viewer nothing but looks like a real one.
+#
+# TiviMate matches per channel, first source wins, and this file is ranked
+# above the provider's own guide. So emitting a single honest "TS" channel
+# here outranks the filler on every one of those channels at once.
+#
+# Everything below is fabricated by us on purpose. It is deliberately kept
+# out of the merge loop and out of the coverage statistics so that no future
+# reader mistakes it for something a source actually published.
+# ---------------------------------------------------------------------------
+PLACEHOLDER_ID = "TS"
+PLACEHOLDER_TITLE = "No guide data"
+PLACEHOLDER_DESC = (
+    "The provider publishes no schedule for this channel. Any listing you "
+    "might otherwise see here is filler, not a real programme guide."
+)
+
+
+def parse_xmltv_time(value: str) -> datetime:
+    """Parse an XMLTV timestamp ('20260810220000 +0100') to an aware datetime.
+
+    Sources mix '+0000' and '+0100' in the same file, so times must be
+    compared as absolute instants - never as raw strings.
+    """
+    stamp, _, offset = value.strip().partition(" ")
+    dt = datetime.strptime(stamp[:14], "%Y%m%d%H%M%S")
+    if len(offset) >= 5 and offset[0] in "+-":
+        shift = timedelta(hours=int(offset[1:3]), minutes=int(offset[3:5]))
+        return dt.replace(tzinfo=timezone(shift if offset[0] == "+" else -shift))
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def add_placeholder_channel(out_channels: dict, out_programmes: list) -> int:
+    """Append the synthetic TS channel, covering the same window as the merge.
+
+    One programme per 24h day: a single long block reads cleanly in the grid,
+    whereas a title repeating every 30 minutes is just noise. Returns the
+    number of fabricated programmes so the caller can keep its stats honest.
+    """
+    instants = []
+    for pr in out_programmes:
+        for attr in ("start", "stop"):
+            if pr.get(attr):
+                try:
+                    instants.append(parse_xmltv_time(pr.get(attr)))
+                except ValueError:
+                    pass
+    if not instants:
+        return 0
+
+    # Whole UTC days spanning the real guide's full extent.
+    first = min(instants).astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    last = max(instants).astimezone(timezone.utc)
+
+    ch = ET.Element("channel", {"id": PLACEHOLDER_ID})
+    ET.SubElement(ch, "display-name").text = PLACEHOLDER_TITLE
+    out_channels[PLACEHOLDER_ID] = ch
+
+    fmt = "%Y%m%d%H%M%S +0000"
+    made = 0
+    day = first
+    while day < last:
+        nxt = day + timedelta(days=1)
+        pr = ET.Element("programme", {
+            "channel": PLACEHOLDER_ID,
+            "start": day.strftime(fmt),
+            "stop": nxt.strftime(fmt),
+        })
+        ET.SubElement(pr, "title", {"lang": "en"}).text = PLACEHOLDER_TITLE
+        ET.SubElement(pr, "desc", {"lang": "en"}).text = PLACEHOLDER_DESC
+        out_programmes.append(pr)
+        made += 1
+        day = nxt
+    return made
 
 
 def main() -> int:
@@ -113,6 +195,12 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
+    # Real coverage is measured BEFORE the synthetic channel is added, so the
+    # placeholder can never flatter these numbers.
+    real_channels = len(out_channels)
+    real_programmes = len(out_programmes)
+    placeholder_days = add_placeholder_channel(out_channels, out_programmes)
+
     tv = ET.Element("tv", {
         "generator-info-name": "neural-nest epg builder",
         "generator-info-url": "https://github.com/",
@@ -133,9 +221,11 @@ def main() -> int:
     print(
         f"\nwrote {OUT}\n"
         f"  built     : {stamp}\n"
-        f"  channels  : {len(out_channels):,}\n"
-        f"  programmes: {len(out_programmes):,} "
+        f"  channels  : {real_channels:,}\n"
+        f"  programmes: {real_programmes:,} "
         f"({seen_prog:,} original + {rewritten:,} rewritten)\n"
+        f"  placeholder: +1 channel ({PLACEHOLDER_ID}), "
+        f"{placeholder_days} days - synthetic, excluded from the counts above\n"
         f"  raw       : {len(payload):,} bytes\n"
         f"  gzipped   : {os.path.getsize(OUT):,} bytes"
     )
