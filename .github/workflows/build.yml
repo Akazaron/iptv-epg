@@ -1,0 +1,75 @@
+name: Build EPG
+
+on:
+  schedule:
+    # 04:20 UTC daily - after the upstream sources have refreshed overnight
+    - cron: "20 4 * * *"
+  workflow_dispatch:        # lets you trigger a rebuild by hand
+  push:
+    paths:
+      - "mapping.json"
+      - "build.py"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-epg
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the guide
+        run: python build.py
+
+      - name: Sanity-check the output
+        run: |
+          set -euo pipefail
+          test -s epg.xml.gz
+          size=$(stat -c%s epg.xml.gz)
+          echo "epg.xml.gz is ${size} bytes"
+          # a healthy build is several MB; anything tiny means a source died
+          if [ "${size}" -lt 1000000 ]; then
+            echo "::error::epg.xml.gz is suspiciously small (${size} bytes) - refusing to publish"
+            exit 1
+          fi
+          # must be valid gzip and valid XML
+          gzip -t epg.xml.gz
+          python - <<'PY'
+          import gzip, xml.etree.ElementTree as ET
+          with gzip.open("epg.xml.gz") as fh:
+              root = ET.parse(fh).getroot()
+          ch = len(root.findall("channel"))
+          pr = len(root.findall("programme"))
+          print(f"parsed OK: {ch} channels, {pr} programmes")
+          assert ch > 100 and pr > 10000, "guide looks empty - not publishing"
+          PY
+
+      - name: Publish to the epg branch
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Orphan branch, force-pushed each run: the repo never accumulates
+          # a multi-megabyte binary in its history.
+          rm -rf .publish && mkdir .publish
+          cp epg.xml.gz .publish/
+          date -u +"built %Y-%m-%d %H:%M UTC" > .publish/LAST_BUILD.txt
+          cd .publish
+          git init -q
+          git checkout -q --orphan epg
+          git add epg.xml.gz LAST_BUILD.txt
+          git commit -q -m "EPG $(date -u +%Y-%m-%d)"
+          git push -q --force \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            epg
+          echo "published"
