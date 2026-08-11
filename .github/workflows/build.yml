@@ -72,7 +72,7 @@ jobs:
           assert ch > 100 and pr > 10000, "guide looks empty - not publishing"
           PY
 
-      - name: Check every mapping entry produced a guide
+      - name: Check mapping entries produced a guide
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -83,14 +83,21 @@ jobs:
           with gzip.open("epg.xml.gz") as fh:
               root = ET.parse(fh).getroot()
           progs = Counter(p.get("channel") for p in root.findall("programme"))
-          # A key with no programmes means its target carries nothing upstream -
-          # renamed, retired, or a typo. Refuse to publish a mapping that lies.
+          # A key with no programmes means its target carries nothing upstream.
+          # Unlike a chain, that is usually NOT our bug: broadcasters change
+          # lineups and feeds add/drop channels routinely. So tolerate a little
+          # churn and still publish - one vanished channel must not hold the
+          # other ~1300 hostage. Only a broad failure means real breakage.
           dead = sorted(k for k in mapping if not progs.get(k))
+          tolerance = max(5, len(mapping) // 20)          # 5 entries or 5%
           for k in dead:
-              print(f"::error::dead mapping: {k} -> {mapping[k]} produced no programmes")
-          if dead:
-              sys.exit(f"{len(dead)} of {len(mapping)} mapping entries produced no guide")
-          print(f"all {len(mapping)} mapping entries carry a guide")
+              level = "error" if len(dead) > tolerance else "warning"
+              print(f"::{level}::dead mapping: {k} -> {mapping[k]} produced no programmes")
+          if len(dead) > tolerance:
+              sys.exit(f"{len(dead)} of {len(mapping)} mapping entries produced no "
+                       f"guide (tolerance {tolerance}) - upstream looks broken")
+          print(f"{len(mapping) - len(dead)}/{len(mapping)} mapping entries carry a "
+                f"guide; {len(dead)} dead (tolerance {tolerance}) - publishing")
           PY
 
       - name: Publish to the epg branch
