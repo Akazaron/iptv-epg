@@ -37,6 +37,7 @@ SOURCES = [
 UA = "Mozilla/5.0 (compatible; epg-builder/1.0)"
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "epg.xml.gz")
+OUT_PROXY = os.path.join(HERE, "epg-proxy.xml.gz")
 
 
 def fetch(url: str) -> bytes:
@@ -128,6 +129,150 @@ def add_placeholder_channel(out_channels: dict, out_programmes: list) -> int:
         made += 1
         day = nxt
     return made
+
+
+# ---------------------------------------------------------------------------
+# Second artifact: epg-proxy.xml.gz - case-folded for a case-insensitive proxy
+#
+# epg.xml.gz deliberately fans one upstream guide out to several provider ids,
+# and 43 of those pairs differ ONLY by case (PremierSports1.uk + premiersports1.uk).
+# TiviMate matches ids case-SENSITIVELY, so it needs both spellings and that
+# file must not change.
+#
+# A tuliprox proxy collapses ids case-INsensitively, so each of those pairs
+# merges and every programme in it appears twice. This second artifact folds
+# every id to lowercase up front and merges the collisions, so a given
+# (channel id, programme start) survives exactly once.
+#
+# Nothing here touches OUT / epg.xml.gz: the fold builds new parent elements
+# and never mutates the ones the first tree holds.
+# ---------------------------------------------------------------------------
+
+
+def _norm(value: str) -> str:
+    """Collapse whitespace so 'A  B' and 'A B' compare equal."""
+    return " ".join((value or "").split())
+
+
+def _norm_instant(value: str) -> str:
+    """Normalise an XMLTV timestamp to an absolute UTC instant.
+
+    Sources express the same moment as both '+0000' and '+0100', so raw start
+    strings would let a genuine duplicate slip through as two distinct keys.
+    """
+    try:
+        return parse_xmltv_time(value).astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
+    except (ValueError, AttributeError):
+        return _norm(value)
+
+
+def signature(el: ET.Element, skip: tuple = ()) -> str:
+    """A whitespace- and timezone-insensitive fingerprint of an element tree.
+
+    Used to tell a true duplicate (drop it) from two sources genuinely
+    disagreeing about the same slot (drop it too, but say so out loud).
+    """
+    parts: list = []
+
+    def walk(e: ET.Element) -> None:
+        attrs = []
+        for k, v in sorted(e.attrib.items()):
+            if k in skip:
+                continue
+            attrs.append((k, _norm_instant(v) if k in ("start", "stop") else _norm(v)))
+        parts.append((e.tag, tuple(attrs), _norm(e.text)))
+        for child in e:
+            walk(child)
+        parts.append(("/", e.tag))
+
+    walk(el)
+    return repr(parts)
+
+
+def _rebrand(el: ET.Element, attr: str, value: str) -> ET.Element:
+    """Copy `el` with one attribute changed, sharing its children by reference.
+
+    Children are only ever read (serialised), never mutated, so sharing them
+    between the two output trees is safe and avoids deep-copying ~146k nodes.
+    """
+    new = ET.Element(el.tag, dict(el.attrib))
+    new.set(attr, value)
+    new.text, new.tail = el.text, el.tail
+    new.extend(list(el))
+    return new
+
+
+def build_proxy_tree(out_channels: dict, out_programmes: list) -> tuple:
+    """Fold every channel id to lowercase, merging rather than repeating.
+
+    Returns (tv element, stats dict). First occurrence wins, which keeps the
+    SOURCES order as the precedence order - the same "first source wins" rule
+    the channel merge above already uses.
+    """
+    channels: dict[str, ET.Element] = {}
+    names: dict[str, set] = {}
+    for cid in sorted(out_channels):
+        low = cid.lower()
+        ch = out_channels[cid]
+        if low not in channels:
+            channels[low] = _rebrand(ch, "id", low)
+            names[low] = {_norm(dn.text) for dn in channels[low].findall("display-name")}
+            continue
+        # Merge: keep the first element, but adopt any display-name spelling
+        # the duplicate carried that we do not already have.
+        for dn in ch.findall("display-name"):
+            if _norm(dn.text) not in names[low]:
+                names[low].add(_norm(dn.text))
+                channels[low].append(dn)
+
+    programmes: list[ET.Element] = []
+    seen: dict[tuple, str] = {}
+    dropped_identical = 0
+    conflicts: list[tuple] = []
+
+    for pr in out_programmes:
+        cid = pr.get("channel")
+        if not cid:
+            continue
+        key = (cid.lower(), _norm_instant(pr.get("start")))
+        sig = signature(pr, skip=("channel",))
+        if key in seen:
+            if seen[key] == sig:
+                dropped_identical += 1
+            else:
+                conflicts.append((key, _norm(pr.findtext("title"))))
+            continue
+        seen[key] = sig
+        programmes.append(_rebrand(pr, "channel", key[0]))
+
+    tv = ET.Element("tv", {
+        "generator-info-name": "neural-nest epg builder (case-folded for proxy)",
+        "generator-info-url": "https://github.com/",
+    })
+    for low in sorted(channels):
+        tv.append(channels[low])
+    for pr in programmes:
+        tv.append(pr)
+
+    return tv, {
+        "channels": len(channels),
+        "programmes": len(programmes),
+        "channels_merged": len(out_channels) - len(channels),
+        "dropped_identical": dropped_identical,
+        "conflicts": conflicts,
+    }
+
+
+def write_proxy(out_channels: dict, out_programmes: list) -> dict:
+    tv, stats = build_proxy_tree(out_channels, out_programmes)
+    buf = io.BytesIO()
+    ET.ElementTree(tv).write(buf, encoding="utf-8", xml_declaration=True)
+    payload = buf.getvalue()
+    with gzip.open(OUT_PROXY, "wb", compresslevel=9) as fh:
+        fh.write(payload)
+    stats["raw"] = len(payload)
+    stats["gz"] = os.path.getsize(OUT_PROXY)
+    return stats
 
 
 def main() -> int:
@@ -229,6 +374,32 @@ def main() -> int:
         f"  raw       : {len(payload):,} bytes\n"
         f"  gzipped   : {os.path.getsize(OUT):,} bytes"
     )
+
+    # Second artifact. epg.xml.gz is already on disk and is never revisited.
+    px = write_proxy(out_channels, out_programmes)
+    print(
+        f"\nwrote {OUT_PROXY}  (case-folded, for a case-insensitive proxy)\n"
+        f"  channels  : {px['channels']:,} "
+        f"({px['channels_merged']:,} case-variant ids merged away)\n"
+        f"  programmes: {px['programmes']:,} "
+        f"({px['dropped_identical']:,} duplicate rows merged)\n"
+        f"  raw       : {px['raw']:,} bytes\n"
+        f"  gzipped   : {px['gz']:,} bytes"
+    )
+    if px["conflicts"]:
+        # Same channel, same start, different content: two sources disagree.
+        # First-in-SOURCES-order wins, but never silently - a real schedule
+        # conflict (rather than richer metadata) is something to go look at.
+        by_channel: dict[str, int] = {}
+        for (cid, _start), _title in px["conflicts"]:
+            by_channel[cid] = by_channel.get(cid, 0) + 1
+        top = sorted(by_channel.items(), key=lambda kv: -kv[1])[:10]
+        print(
+            f"  conflicts : {len(px['conflicts']):,} slots where sources disagreed "
+            f"across {len(by_channel)} channels - kept the first, dropped the rest"
+        )
+        for cid, n in top:
+            print(f"::warning::proxy fold: {cid} had {n} conflicting slots")
     return 0
 
 

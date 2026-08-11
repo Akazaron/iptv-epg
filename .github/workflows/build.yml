@@ -72,6 +72,61 @@ jobs:
           assert ch > 100 and pr > 10000, "guide looks empty - not publishing"
           PY
 
+      - name: Sanity-check the proxy output
+        run: |
+          set -euo pipefail
+          test -s epg-proxy.xml.gz
+          size=$(stat -c%s epg-proxy.xml.gz)
+          echo "epg-proxy.xml.gz is ${size} bytes"
+          # Same floor as epg.xml.gz: the fold only ever removes duplicate rows,
+          # so a healthy proxy build is within a few percent of the main file.
+          if [ "${size}" -lt 1000000 ]; then
+            echo "::error::epg-proxy.xml.gz is suspiciously small (${size} bytes) - refusing to publish"
+            exit 1
+          fi
+          gzip -t epg-proxy.xml.gz
+          python - <<'PY'
+          import gzip, sys, xml.etree.ElementTree as ET
+          from collections import Counter
+          from datetime import datetime, timedelta, timezone
+
+          def instant(value):
+              stamp, _, offset = (value or "").strip().partition(" ")
+              try:
+                  dt = datetime.strptime(stamp[:14], "%Y%m%d%H%M%S")
+              except ValueError:
+                  return (value or "").strip()
+              if len(offset) >= 5 and offset[0] in "+-":
+                  shift = timedelta(hours=int(offset[1:3]), minutes=int(offset[3:5]))
+                  dt = dt.replace(tzinfo=timezone(shift if offset[0] == "+" else -shift))
+              else:
+                  dt = dt.replace(tzinfo=timezone.utc)
+              return dt.astimezone(timezone.utc).isoformat()
+
+          with gzip.open("epg-proxy.xml.gz") as fh:
+              root = ET.parse(fh).getroot()
+          chans = root.findall("channel")
+          progs = root.findall("programme")
+          print(f"parsed OK: {len(chans)} channels, {len(progs)} programmes")
+          assert len(chans) > 100 and len(progs) > 10000, "proxy guide looks empty - not publishing"
+
+          # The two invariants that are the whole point of this artifact. A
+          # regression here must fail the build, not publish a double-booked guide.
+          mixed = [c.get("id") for c in chans if c.get("id") != (c.get("id") or "").lower()]
+          for cid in mixed[:20]:
+              print(f"::error::proxy channel id is not lowercase: {cid}")
+          if mixed:
+              sys.exit(f"{len(mixed)} proxy channel ids are not case-folded")
+
+          slots = Counter((p.get("channel"), instant(p.get("start"))) for p in progs)
+          dupes = [k for k, v in slots.items() if v > 1]
+          for cid, start in dupes[:20]:
+              print(f"::error::proxy has a duplicated slot: {cid} @ {start}")
+          if dupes:
+              sys.exit(f"{len(dupes)} duplicated (channel, start) slots in the proxy guide")
+          print(f"proxy OK: all ids lowercase, {len(slots)} unique slots, zero duplicates")
+          PY
+
       - name: Check mapping entries produced a guide
         run: |
           set -euo pipefail
@@ -110,12 +165,12 @@ jobs:
           # Orphan branch, force-pushed each run: the repo never accumulates
           # a multi-megabyte binary in its history.
           rm -rf .publish && mkdir .publish
-          cp epg.xml.gz .publish/
+          cp epg.xml.gz epg-proxy.xml.gz .publish/
           date -u +"built %Y-%m-%d %H:%M UTC" > .publish/LAST_BUILD.txt
           cd .publish
           git init -q
           git checkout -q --orphan epg
-          git add epg.xml.gz LAST_BUILD.txt
+          git add epg.xml.gz epg-proxy.xml.gz LAST_BUILD.txt
           git commit -q -m "EPG $(date -u +%Y-%m-%d)"
           git push -q --force \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
