@@ -57,8 +57,10 @@ jobs:
       - name: Publish to the epg branch
         run: |
           set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # --global is required: the publish step runs `git init` in a fresh
+          # directory, which does not inherit the checked-out repo's config.
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # Orphan branch, force-pushed each run: the repo never accumulates
           # a multi-megabyte binary in its history.
           rm -rf .publish && mkdir .publish
