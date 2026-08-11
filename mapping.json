@@ -10,7 +10,7 @@
     "CartoonNetwork.uk":  "Cartoon.Network.ie",
     "skythriller.uk":  "Sky.Thriller.ie",
     "Boomerang.uk":  "Boomerang.ie",
-    "bbc1.uk":  "BBC1.HD.ie",
+    "BBC1.uk":  "BBCOneNorthernIreland.uk",
     "NatGeo.uk":  "Nat.Geo.HD.uk",
     "ZeeTV.uk":  "Zee.TV.HD.uk",
     "SkyCinemaHits.uk":  "Sky.Cinema.Hits.HD.uk",
@@ -38,7 +38,7 @@
     "skysportstennis.uk":  "Sky.Sports.Tennis.HD.ie",
     "TVCNews.uk":  "TVCNews.ng",
     "LoveWorld.us":  "LoveWorld.HD.uk",
-    "BBC2.uk":  "BBCTwoHD.uk",
+    "BBC2.uk":  "BBCTwoNorthernIreland.uk",
     "mtv.uk":  "MTV.HD.uk",
     "SkyKids.uk":  "Sky.Kids.HD.uk",
     "nickelodeon.fr":  "Nickelodeon.HD.ie",
@@ -112,5 +112,6 @@
     "DisneyJunior.fr":  "Disney.Jr.HD.uk",
     "HighStreet2.uk":  "HighStreetTV2.uk",
     "DisneyJunior.uk":  "Disney.Jr.HD.uk",
-    "DisneyJunior.us":  "Disney.Jr.HD.uk"
+    "DisneyJunior.us":  "Disney.Jr.HD.uk",
+    "BBC2NI.uk":  "BBCTwoNorthernIreland.uk"
 }
